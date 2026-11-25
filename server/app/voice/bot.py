@@ -13,6 +13,7 @@ from app.container import appointment_service, json_repository
 from app.core.config import APP_TIMEZONE, APP_TIMEZONE_NAME
 from app.core.errors import DomainError
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -30,6 +31,8 @@ from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.tts_service import TextAggregationMode
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy, VADUserTurnStartStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.text.transforms import strip_markdown
 from pipecat.workers.runner import WorkerRunner
 
@@ -52,6 +55,15 @@ Grounding and conversation:
   "Doctor:" and "Date:". Say details naturally in complete sentences.
 - Keep replies to one short sentence whenever possible, and at most two short sentences when
   needed. Ask one short question at a time and use the caller's language when you can do so reliably.
+- Speak like a calm, natural clinic receptionist. Use simple conversational wording and natural
+  contractions. Avoid robotic lists, unnecessary filler, and repeated phrases.
+- Once you start speaking a reply, finish it before responding to speech from the caller. Do not
+  restart or repeat the beginning of the reply. Then listen to the caller's full turn.
+- Treat a one-second pause as the end of the caller's turn and respond promptly. Do not add an
+  unnecessary delay after the caller has finished speaking.
+- After each spoken reply, stop and listen. The client gives the caller up to eight seconds to
+  respond, then speaks a brief polite goodbye and ends the call if there is no response. Do not
+  repeat a question during that waiting period.
 - Greet the caller once when the session first starts. In later turns, answer directly without
   repeating the welcome unless the caller greets you again or has rejoined a new session.
 - Use the current local date and time supplied in the developer message to resolve relative dates.
@@ -64,7 +76,7 @@ Caller identity and phone confirmation:
 - Identify the caller only by the phone number they speak during this call. Do not use caller ID,
   login, OTP, or a number supplied by another source.
 - When they give a number, call set_caller_phone, read the normalized number back one digit at a
-  time, and ask whether it is correct.
+  time, and ask whether it is correct, and also add 91 at beginning of every number as default.
 - Call confirm_caller_phone with confirmed=true only after an explicit yes. If they correct or
   reject the number, save the corrected number and ask them to confirm it again.
 - Never list, book, or cancel appointments before the caller's phone number is confirmed.
@@ -256,7 +268,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     llm = GroqLLMService(
         api_key=os.environ["GROQ_API_KEY"],
         settings=GroqLLMService.Settings(
-            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
             system_instruction=SYSTEM_INSTRUCTION,
         ),
     )
@@ -304,7 +316,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        user_params=LLMUserAggregatorParams(
+            user_turn_stop_timeout=1.0,
+            user_turn_strategies=UserTurnStrategies(
+                start=[
+                    VADUserTurnStartStrategy(enable_interruptions=False),
+                    TranscriptionUserTurnStartStrategy(enable_interruptions=False),
+                ]
+            ),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=1.0)),
+        ),
     )
     pipeline = Pipeline(
         [

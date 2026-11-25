@@ -52,7 +52,7 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-The REST API works without AI keys. To run the voice agent with the default ElevenLabs TTS, edit `.env` and set `GROQ_API_KEY`, `ELEVENLABS_API_KEY`, and an `ELEVENLABS_VOICE_ID` enabled for API use on your account. `GROQ_MODEL` defaults to `openai/gpt-oss-120b`. Some free ElevenLabs accounts cannot use shared library voices through the API. The dashboard also has a browser speech fallback when a TTS response contains text but no audio.
+The REST API works without AI keys. To run the voice agent with the default ElevenLabs TTS, edit `.env` and set `GROQ_API_KEY`, `ELEVENLABS_API_KEY`, and an `ELEVENLABS_VOICE_ID` enabled for API use on your account. `GROQ_MODEL` defaults to `openai/gpt-oss-20b` for faster responses with tool calling. Some free ElevenLabs accounts cannot use shared library voices through the API. The dashboard also has a browser speech fallback when a TTS response contains text but no audio.
 
 To use Groq for speech instead, set `VOICE_TTS_PROVIDER=groq` in `.env`. The current Groq Orpheus English defaults are `GROQ_TTS_MODEL=canopylabs/orpheus-v1-english` and `GROQ_TTS_VOICE=autumn`. Before using that model, the Groq organization admin must accept its terms at <https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english>. If terms are not accepted, Groq returns `model_terms_required` and no audio is generated. Restart the Pipecat voice server after changing `.env`. Do not commit `.env` or real API keys.
 

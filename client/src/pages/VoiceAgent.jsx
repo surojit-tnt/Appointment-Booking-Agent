@@ -58,6 +58,16 @@ export default function VoiceAgent() {
   const lastFinalUserRef = useRef({ text: '', turn: -1 });
   const userTurnRef = useRef(0);
   const noAudioTimerRef = useRef(null);
+  const idleResponseTimerRef = useRef(null);
+  const farewellWatchdogRef = useRef(null);
+  const scheduleIdleResponseRef = useRef(null);
+  const endCallRef = useRef(null);
+  const autoClosingRef = useRef(false);
+  const userSpeakingRef = useRef(false);
+  const micEnabledRef = useRef(true);
+  const micEnabledBeforeAgentSpeechRef = useRef(null);
+  const activeAgentSpeechRef = useRef(new Set());
+  const browserSpeechSourceRef = useRef(null);
   const fallbackActiveRef = useRef(false);
   const fallbackAttemptedForTurnRef = useRef(false);
   const fallbackReasonRef = useRef('');
@@ -73,6 +83,7 @@ export default function VoiceAgent() {
   const [textInput, setTextInput] = useState('');
   const [sendingText, setSendingText] = useState(false);
   const [micEnabled, setMicEnabled] = useState(true);
+  const [assistantSpeaking, setAssistantSpeaking] = useState(false);
 
   const pushEntry = useCallback((speaker, text, partial = false) => {
     const id = `caption-${++entryIdRef.current}`;
@@ -86,12 +97,53 @@ export default function VoiceAgent() {
     setEntries((current) => current.map((entry) => entry.id === id ? { ...entry, text, partial } : entry));
   }, []);
 
+  const clearIdleResponseTimer = useCallback(() => {
+    if (idleResponseTimerRef.current) window.clearTimeout(idleResponseTimerRef.current);
+    idleResponseTimerRef.current = null;
+  }, []);
+
+  const changeMicrophoneState = useCallback((enabled) => {
+    const client = clientRef.current;
+    if (!client) return;
+    try {
+      client.enableMic(enabled);
+      micEnabledRef.current = enabled;
+      setMicEnabled(enabled);
+    } catch (error) {
+      setDiagnostic({ title: 'Could not change microphone state', message: errorMessage(error), details: JSON.stringify(error, null, 2) });
+    }
+  }, []);
+
+  const beginAgentSpeech = useCallback((source) => {
+    const activeSources = activeAgentSpeechRef.current;
+    if (activeSources.has(source)) return;
+    if (activeSources.size === 0) micEnabledBeforeAgentSpeechRef.current = micEnabledRef.current;
+    activeSources.add(source);
+    setAssistantSpeaking(true);
+    if (micEnabledRef.current) changeMicrophoneState(false);
+  }, [changeMicrophoneState]);
+
+  const finishAgentSpeech = useCallback((source) => {
+    const activeSources = activeAgentSpeechRef.current;
+    if (!activeSources.delete(source)) return;
+    if (activeSources.size > 0) return;
+    setAssistantSpeaking(false);
+    const shouldRestoreMicrophone = micEnabledBeforeAgentSpeechRef.current;
+    micEnabledBeforeAgentSpeechRef.current = null;
+    if (shouldRestoreMicrophone) changeMicrophoneState(true);
+  }, [changeMicrophoneState]);
+
   const stopBrowserSpeech = useCallback(() => {
     fallbackActiveRef.current = false;
     if (noAudioTimerRef.current) window.clearTimeout(noAudioTimerRef.current);
     noAudioTimerRef.current = null;
+    clearIdleResponseTimer();
+    if (browserSpeechSourceRef.current) {
+      finishAgentSpeech(browserSpeechSourceRef.current);
+      browserSpeechSourceRef.current = null;
+    }
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-  }, []);
+  }, [clearIdleResponseTimer, finishAgentSpeech]);
 
   const speakWithBrowser = useCallback((text, reason = '') => {
     const cleaned = String(text || '').trim();
@@ -101,27 +153,58 @@ export default function VoiceAgent() {
     }
     if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
       setCaptionStatus('Browser speech is unavailable in this browser');
+      if (autoClosingRef.current) endCallRef.current?.();
+      else scheduleIdleResponseRef.current?.();
       return false;
     }
     fallbackActiveRef.current = true;
     if (noAudioTimerRef.current) window.clearTimeout(noAudioTimerRef.current);
     noAudioTimerRef.current = null;
+    if (browserSpeechSourceRef.current) {
+      finishAgentSpeech(browserSpeechSourceRef.current);
+      browserSpeechSourceRef.current = null;
+    }
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(cleaned);
+    const speechSource = {};
+    browserSpeechSourceRef.current = speechSource;
+    beginAgentSpeech(speechSource);
     utterance.lang = navigator.language || 'en-US';
     utterance.rate = 1;
     utterance.onstart = () => { if (mountedRef.current) setCaptionStatus('Speaking with browser voice'); };
-    utterance.onend = () => { if (mountedRef.current) setCaptionStatus('Browser voice finished · waiting for you'); };
+    utterance.onend = () => {
+      if (!mountedRef.current) return;
+      fallbackActiveRef.current = false;
+      finishAgentSpeech(speechSource);
+      if (browserSpeechSourceRef.current === speechSource) browserSpeechSourceRef.current = null;
+      setCaptionStatus('Browser voice finished · waiting for you');
+      if (autoClosingRef.current) endCallRef.current?.();
+      else scheduleIdleResponseRef.current?.();
+    };
     utterance.onerror = (event) => {
       if (!mountedRef.current) return;
+      const wasActive = fallbackActiveRef.current;
+      fallbackActiveRef.current = false;
+      finishAgentSpeech(speechSource);
+      if (browserSpeechSourceRef.current === speechSource) browserSpeechSourceRef.current = null;
       const detail = event?.error ? ` (${event.error})` : '';
       setCaptionStatus(`Browser speech failed${detail}`);
       setDiagnostic((current) => ({ title: 'Browser speech fallback failed', message: `The browser could not play assistant speech${detail}. Check the output device and browser audio permissions.`, details: current?.details || reason }));
+      if (autoClosingRef.current) endCallRef.current?.();
+      else if (wasActive) scheduleIdleResponseRef.current?.();
     };
-    window.speechSynthesis.resume();
-    window.speechSynthesis.speak(utterance);
-    return true;
-  }, []);
+    try {
+      window.speechSynthesis.resume();
+      window.speechSynthesis.speak(utterance);
+      return true;
+    } catch (error) {
+      fallbackActiveRef.current = false;
+      finishAgentSpeech(speechSource);
+      if (browserSpeechSourceRef.current === speechSource) browserSpeechSourceRef.current = null;
+      setDiagnostic({ title: 'Browser speech fallback failed', message: errorMessage(error), details: error?.stack || '' });
+      return false;
+    }
+  }, [beginAgentSpeech, finishAgentSpeech]);
 
   const tryBrowserFallback = useCallback((reason = '') => {
     if (fallbackAttemptedForTurnRef.current) return false;
@@ -141,6 +224,23 @@ export default function VoiceAgent() {
     return started;
   }, [speakWithBrowser]);
 
+  const scheduleIdleResponse = useCallback(() => {
+    clearIdleResponseTimer();
+    if (!clientRef.current?.connected || autoClosingRef.current || userSpeakingRef.current) return;
+    idleResponseTimerRef.current = window.setTimeout(() => {
+      idleResponseTimerRef.current = null;
+      if (!clientRef.current?.connected || autoClosingRef.current || userSpeakingRef.current) return;
+      autoClosingRef.current = true;
+      const farewell = "I haven't heard back, so I'll end the call now. Thank you for calling. Goodbye.";
+      pushEntry('assistant', farewell);
+      setVoiceMessage('No response received. Ending the call.');
+      setCaptionStatus('Call closing');
+      farewellWatchdogRef.current = window.setTimeout(() => endCallRef.current?.(), 12000);
+      if (!speakWithBrowser(farewell, 'Automatic call closing')) endCallRef.current?.();
+    }, 8000);
+  }, [clearIdleResponseTimer, pushEntry, speakWithBrowser]);
+  scheduleIdleResponseRef.current = scheduleIdleResponse;
+
   const scheduleNoAudioFallback = useCallback(() => {
     if (noAudioTimerRef.current || fallbackActiveRef.current) return;
     noAudioTimerRef.current = window.setTimeout(() => {
@@ -155,6 +255,7 @@ export default function VoiceAgent() {
     const data = message?.data && typeof message.data === 'object' ? message.data : message;
     const text = String(typeof data === 'string' ? data : data?.text || '').trim();
     if (!text) return;
+    clearIdleResponseTimer();
     const partial = data?.final === false;
     if (!partial) {
       const normalized = text.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
@@ -166,7 +267,7 @@ export default function VoiceAgent() {
     else updateEntry(activeUserEntryRef.current, text, partial);
     if (!partial) activeUserEntryRef.current = null;
     setCaptionStatus(partial ? 'Listening · live caption updating' : 'Request received · preparing a reply');
-  }, [pushEntry, updateEntry]);
+  }, [clearIdleResponseTimer, pushEntry, updateEntry]);
 
   const handleBotOutput = useCallback((message) => {
     if (!message || message.will_be_spoken === false) return;
@@ -205,6 +306,10 @@ export default function VoiceAgent() {
   }, [pushEntry, scheduleNoAudioFallback, updateEntry]);
 
   const endCall = useCallback(async () => {
+    autoClosingRef.current = false;
+    clearIdleResponseTimer();
+    if (farewellWatchdogRef.current) window.clearTimeout(farewellWatchdogRef.current);
+    farewellWatchdogRef.current = null;
     const client = clientRef.current;
     if (!client) {
       setVoiceState('idle');
@@ -214,6 +319,9 @@ export default function VoiceAgent() {
     setVoiceState('disconnecting');
     setVoiceMessage('Ending the call…');
     stopBrowserSpeech();
+    activeAgentSpeechRef.current.clear();
+    micEnabledBeforeAgentSpeechRef.current = null;
+    setAssistantSpeaking(false);
     try {
       await client.disconnect();
     } catch (error) {
@@ -224,17 +332,24 @@ export default function VoiceAgent() {
       setVoiceMessage('Call ended');
       setCaptionStatus('Call ended');
     }
-  }, [stopBrowserSpeech]);
+  }, [clearIdleResponseTimer, stopBrowserSpeech]);
+  endCallRef.current = endCall;
 
   const startCall = useCallback(async () => {
     if (clientRef.current || voiceState === 'connecting') return;
     stopBrowserSpeech();
+    autoClosingRef.current = false;
+    userSpeakingRef.current = false;
     setVoiceState('connecting');
     setVoiceMessage('Requesting microphone access and connecting…');
     setCaptionStatus('Connecting to the voice assistant');
     setDiagnostic(null);
     setCallSeconds(0);
     setMicEnabled(true);
+    micEnabledRef.current = true;
+    micEnabledBeforeAgentSpeechRef.current = null;
+    activeAgentSpeechRef.current.clear();
+    setAssistantSpeaking(false);
     setEntries([]);
     entryIdRef.current = 0;
     assistantSegmentsRef.current.clear();
@@ -266,8 +381,13 @@ export default function VoiceAgent() {
           },
           onDisconnected: () => {
             stopBrowserSpeech();
+            if (farewellWatchdogRef.current) window.clearTimeout(farewellWatchdogRef.current);
+            farewellWatchdogRef.current = null;
+            activeAgentSpeechRef.current.clear();
+            micEnabledBeforeAgentSpeechRef.current = null;
             clientRef.current = null;
             if (mountedRef.current) {
+              setAssistantSpeaking(false);
               setVoiceState('idle');
               setVoiceMessage('Call ended');
               setCaptionStatus('Call ended');
@@ -300,19 +420,31 @@ export default function VoiceAgent() {
           onBotStartedSpeaking: () => {
             if (noAudioTimerRef.current) window.clearTimeout(noAudioTimerRef.current);
             noAudioTimerRef.current = null;
+            beginAgentSpeech('server');
             stopBrowserSpeech();
             setCaptionStatus('Assistant is speaking');
           },
-          onBotStoppedSpeaking: () => setCaptionStatus('Waiting for you to speak'),
+          onBotStoppedSpeaking: () => {
+            finishAgentSpeech('server');
+            setCaptionStatus('Waiting for you to speak');
+            scheduleIdleResponse();
+          },
           onUserStartedSpeaking: () => {
             userTurnRef.current += 1;
+            userSpeakingRef.current = true;
+            if (autoClosingRef.current) {
+              endCallRef.current?.();
+              return;
+            }
+            clearIdleResponseTimer();
             if (noAudioTimerRef.current) window.clearTimeout(noAudioTimerRef.current);
             noAudioTimerRef.current = null;
-            fallbackActiveRef.current = false;
-            if ('speechSynthesis' in window) window.speechSynthesis.cancel();
             setCaptionStatus('Listening to you');
           },
-          onUserStoppedSpeaking: () => setCaptionStatus('Processing what you said'),
+          onUserStoppedSpeaking: () => {
+            userSpeakingRef.current = false;
+            setCaptionStatus('Processing what you said');
+          },
           onError: (error) => {
             const message = errorMessage(error);
             const details = JSON.stringify(error, null, 2);
@@ -352,13 +484,15 @@ export default function VoiceAgent() {
       setDiagnostic({ title: 'Voice call failed', message, details: error?.stack || JSON.stringify(error, null, 2) });
       notify(message, 'error');
     }
-  }, [handleBotLlmText, handleBotOutput, handleUserTranscript, notify, stopBrowserSpeech, tryBrowserFallback, updateEntry, voiceState]);
+  }, [beginAgentSpeech, clearIdleResponseTimer, finishAgentSpeech, handleBotLlmText, handleBotOutput, handleUserTranscript, notify, scheduleIdleResponse, stopBrowserSpeech, tryBrowserFallback, updateEntry, voiceState]);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       stopBrowserSpeech();
+      if (farewellWatchdogRef.current) window.clearTimeout(farewellWatchdogRef.current);
+      farewellWatchdogRef.current = null;
       if (clientRef.current) clientRef.current.disconnect().catch(() => {});
       clientRef.current = null;
     };
@@ -374,6 +508,11 @@ export default function VoiceAgent() {
     event.preventDefault();
     const text = textInput.trim();
     if (!text || !clientRef.current?.connected) return;
+    if (autoClosingRef.current) {
+      endCallRef.current?.();
+      return;
+    }
+    clearIdleResponseTimer();
     setSendingText(true);
     setTextInput('');
     try {
@@ -389,15 +528,8 @@ export default function VoiceAgent() {
   }
 
   function toggleMicrophone() {
-    if (!clientRef.current) return;
-    try {
-      const next = !micEnabled;
-      clientRef.current.enableMic(next);
-      setMicEnabled(next);
-    } catch (error) {
-      const message = errorMessage(error);
-      setDiagnostic({ title: 'Could not change microphone state', message, details: JSON.stringify(error, null, 2) });
-    }
+    if (!clientRef.current || activeAgentSpeechRef.current.size > 0) return;
+    changeMicrophoneState(!micEnabledRef.current);
   }
 
   function clearTranscript() {
@@ -443,13 +575,13 @@ export default function VoiceAgent() {
         <p className="voice-intro">Ask about doctors and availability, or book and cancel after confirming the patient’s phone number.</p>
         <div className="voice-controls">
           <button className="button button-primary start-call" type="button" onClick={startCall} disabled={isActive || isBusy}><Mic size={17} />{voiceState === 'connecting' ? 'Connecting…' : 'Start call'}</button>
-          {isActive && <button className="button button-secondary mic-toggle" type="button" onClick={toggleMicrophone} aria-label={micEnabled ? 'Mute microphone' : 'Unmute microphone'}>{micEnabled ? <Mic size={16} /> : <MicOff size={16} />}</button>}
+          {isActive && <button className="button button-secondary mic-toggle" type="button" onClick={toggleMicrophone} disabled={assistantSpeaking} aria-label={assistantSpeaking ? 'Microphone muted while assistant speaks' : micEnabled ? 'Mute microphone' : 'Unmute microphone'}>{micEnabled ? <Mic size={16} /> : <MicOff size={16} />}</button>}
           <button className="button button-danger end-call" type="button" onClick={endCall} disabled={!isActive}><PhoneOff size={16} />End call</button>
         </div>
         <p className={`voice-state-copy ${voiceState === 'error' ? 'error-text' : ''}`}>{voiceMessage}</p>
       </section>
 
-      {diagnostic && <div className="voice-diagnostic" role="alert"><div className="diagnostic-heading"><strong>{diagnostic.title}</strong><button type="button" aria-label="Dismiss error" onClick={() => setDiagnostic(null)}>×</button></div><p>{diagnostic.message}</p>{diagnostic.details && <details><summary>Exact response / error details</summary><pre>{diagnostic.details}</pre></details>}</div>}
+      {/* {diagnostic && <div className="voice-diagnostic" role="alert"><div className="diagnostic-heading"><strong>{diagnostic.title}</strong><button type="button" aria-label="Dismiss error" onClick={() => setDiagnostic(null)}>×</button></div><p>{diagnostic.message}</p>{diagnostic.details && <details><summary>Exact response / error details</summary><pre>{diagnostic.details}</pre></details>}</div>} */}
 
       <section className="panel conversation-panel" aria-label="Live conversation transcript">
         <div className="conversation-heading"><div className="conversation-title"><span className="conversation-icon"><Bot size={18} /></span><div><div className="conversation-title-line"><h2>Live clinical conversation</h2><span className="live-feed-chip">{isActive ? 'Live feed' : 'Transcript'}</span></div><p>Voice captions from the microphone and assistant response appear here.</p></div></div><div className="conversation-actions"><button className="button button-small button-secondary" type="button" onClick={exportTranscript} disabled={!entries.length}><Download size={14} />Export .txt</button><button className="icon-button" type="button" onClick={clearTranscript} aria-label="Clear transcript"><Trash2 size={15} /></button></div></div>
