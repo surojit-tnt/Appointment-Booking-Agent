@@ -1,0 +1,7 @@
+fastapi>=0.115.6,<1.0
+uvicorn[standard]>=0.32,<1.0
+python-dotenv>=1.0,<2.0
+filelock>=3.16,<4.0
+tzdata>=2024.1
+pipecat-ai[elevenlabs,groq,runner,silero,webrtc]>=0.0.105,<2.0
+groq>=0.23.0,<2.0
